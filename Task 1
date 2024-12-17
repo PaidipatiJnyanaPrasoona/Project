@@ -1,0 +1,145 @@
+import os
+import pdfplumber
+import pytesseract
+from pytesseract import Output
+from pdf2image import convert_from_path
+from sentence_transformers import SentenceTransformer
+import faiss
+import openai
+import pandas as pd
+
+# OpenAI API key
+openai.api_key = "your_openai_api_key"
+
+# Global Variables
+VECTOR_DIMENSION = 768
+MODEL_NAME = 'all-MiniLM-L6-v2'
+
+# Initialize model and FAISS
+embedding_model = SentenceTransformer(MODEL_NAME)
+faiss_index = faiss.IndexFlatL2(VECTOR_DIMENSION)
+document_chunks = []  # To map vector IDs to chunks
+
+# Step 1: Data Ingestion
+def extract_text_from_pdf(file_path):
+    """
+    Extract text from PDF using pdfplumber and OCR (if needed).
+    """
+    text = ""
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+    except Exception as e:
+        print(f"Error extracting text with pdfplumber: {e}")
+
+    # OCR for scanned PDFs if text is not extracted
+    if not text.strip():
+        print("No text found, applying OCR...")
+        images = convert_from_path(file_path)
+        for img in images:
+            text += pytesseract.image_to_string(img, lang='eng', config='--psm 6')
+    
+    return text
+
+def chunk_text(text, chunk_size=512, overlap=50):
+    """
+    Split text into overlapping chunks for embedding.
+    """
+    chunks = []
+    words = text.split()
+    for i in range(0, len(words), chunk_size - overlap):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+    return chunks
+
+def embed_chunks(chunks):
+    """
+    Generate embeddings for text chunks and add them to the FAISS index.
+    """
+    embeddings = embedding_model.encode(chunks, convert_to_numpy=True)
+    global document_chunks
+    document_chunks.extend(chunks)
+    faiss_index.add(embeddings)
+
+def ingest_pdf(file_path):
+    """
+    Ingest a PDF file by extracting, chunking, and embedding its content.
+    """
+    print(f"Ingesting {file_path}...")
+    text = extract_text_from_pdf(file_path)
+    chunks = chunk_text(text)
+    embed_chunks(chunks)
+
+# Step 2: Query Handling
+def search_similar_chunks(query, top_k=5):
+    """
+    Perform similarity search for the user query in the FAISS index.
+    """
+    query_embedding = embedding_model.encode([query], convert_to_numpy=True)
+    distances, indices = faiss_index.search(query_embedding, top_k)
+    results = [(document_chunks[idx], distances[i]) for i, idx in enumerate(indices[0])]
+    return results
+
+# Step 3: Comparison Queries
+def handle_comparison_query(query, top_k=5):
+    """
+    Handle comparison queries by extracting relevant fields across documents.
+    """
+    # Parse query for key terms (this can be extended with NLP parsing)
+    if "compare" not in query.lower():
+        raise ValueError("Query doesn't seem to be a comparison query.")
+
+    similar_chunks = search_similar_chunks(query, top_k=top_k)
+    comparisons = []
+
+    for chunk, _ in similar_chunks:
+        # Simple parsing logic for extracting key-value pairs (customize as needed)
+        rows = [line for line in chunk.split("\n") if ":" in line]
+        parsed_data = {row.split(":")[0].strip(): row.split(":")[1].strip() for row in rows}
+        comparisons.append(parsed_data)
+
+    # Create a structured comparison table
+    comparison_table = pd.DataFrame(comparisons)
+    return comparison_table
+
+# Step 4: Response Generation
+def generate_response(query, context_chunks):
+    """
+    Use OpenAI GPT model to generate a detailed response using retrieved context.
+    """
+    context = "\n\n".join(context_chunks)
+    prompt = f"Answer the following question using the provided context:\n\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:"
+    
+    response = openai.Completion.create(
+        engine="text-davinci-003",
+        prompt=prompt,
+        max_tokens=200,
+        temperature=0.7
+    )
+    return response['choices'][0]['text'].strip()
+
+# Main Pipeline
+def main():
+    # Step 1: Data Ingestion
+    pdf_files = ["file1.pdf", "file2.pdf"]  # Replace with your PDF paths
+    for file in pdf_files:
+        ingest_pdf(file)
+
+    # Step 2: Handle User Query
+    user_query = input("Enter your query: ")
+
+    if "compare" in user_query.lower():
+        # Step 3: Handle Comparison Queries
+        comparison_table = handle_comparison_query(user_query)
+        print("\nComparison Table:")
+        print(comparison_table)
+    else:
+        # Handle general queries
+        similar_chunks = search_similar_chunks(user_query)
+        context_chunks = [chunk for chunk, _ in similar_chunks]
+        response = generate_response(user_query, context_chunks)
+        print("\nResponse:")
+        print(response)
+
+if __name__ == "__main__":
+    main()
