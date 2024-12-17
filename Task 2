@@ -1,0 +1,121 @@
+import requests
+from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
+import faiss
+import openai
+
+# Set OpenAI API Key
+openai.api_key = "your_openai_api_key"
+
+# Constants
+VECTOR_DIMENSION = 768
+MODEL_NAME = 'all-MiniLM-L6-v2'
+
+# Initialize the embedding model and FAISS index
+embedding_model = SentenceTransformer(MODEL_NAME)
+faiss_index = faiss.IndexFlatL2(VECTOR_DIMENSION)
+content_chunks = []  # Store chunks for reference
+metadata_store = []  # Store metadata for chunks
+
+# Step 1: Data Ingestion
+def scrape_website(url):
+    """
+    Scrape and extract content from a given website.
+    """
+    print(f"Scraping website: {url}")
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Error retrieving {url}: {e}")
+        return None
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    # Extract text content from common tags
+    paragraphs = soup.find_all(['p', 'h1', 'h2', 'h3', 'li'])
+    content = "\n".join([para.get_text(strip=True) for para in paragraphs])
+    return content
+
+def chunk_text(text, chunk_size=512, overlap=50):
+    """
+    Split text into overlapping chunks for embedding.
+    """
+    chunks = []
+    words = text.split()
+    for i in range(0, len(words), chunk_size - overlap):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+    return chunks
+
+def embed_chunks(chunks, url):
+    """
+    Generate embeddings for text chunks and add them to the FAISS index.
+    """
+    embeddings = embedding_model.encode(chunks, convert_to_numpy=True)
+    global content_chunks, metadata_store
+    content_chunks.extend(chunks)
+    metadata_store.extend([{"url": url, "chunk": chunk} for chunk in chunks])
+    faiss_index.add(embeddings)
+
+def ingest_website(url):
+    """
+    Ingest a website: scrape, chunk, and embed its content.
+    """
+    print(f"Ingesting {url}...")
+    content = scrape_website(url)
+    if content:
+        chunks = chunk_text(content)
+        embed_chunks(chunks, url)
+
+# Step 2: Query Handling
+def search_similar_chunks(query, top_k=5):
+    """
+    Perform a similarity search for a user query in the FAISS index.
+    """
+    query_embedding = embedding_model.encode([query], convert_to_numpy=True)
+    distances, indices = faiss_index.search(query_embedding, top_k)
+    results = [
+        {"chunk": content_chunks[idx], "metadata": metadata_store[idx], "distance": distances[0][i]}
+        for i, idx in enumerate(indices[0])
+    ]
+    return results
+
+# Step 3: Response Generation
+def generate_response(query, context_chunks):
+    """
+    Use OpenAI GPT to generate a response based on retrieved chunks.
+    """
+    context = "\n\n".join(context_chunks)
+    prompt = f"Answer the following question using the provided context:\n\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:"
+    
+    response = openai.Completion.create(
+        engine="text-davinci-003",
+        prompt=prompt,
+        max_tokens=200,
+        temperature=0.7
+    )
+    return response['choices'][0]['text'].strip()
+
+# Main Pipeline
+def main():
+    # Step 1: Data Ingestion
+    urls = ["https://example.com", "https://example.org"]  # Replace with your list of URLs
+    for url in urls:
+        ingest_website(url)
+
+    # Step 2: Handle User Query
+    user_query = input("Enter your query: ")
+
+    # Retrieve the most relevant chunks
+    similar_chunks = search_similar_chunks(user_query)
+    context_chunks = [result["chunk"] for result in similar_chunks]
+
+    # Step 3: Generate Response
+    if context_chunks:
+        response = generate_response(user_query, context_chunks)
+        print("\nResponse:")
+        print(response)
+    else:
+        print("\nNo relevant information found.")
+
+if __name__ == "__main__":
+    main()
